@@ -1,6 +1,11 @@
-import pickle
+import torch
 
-with open("/data/lxy/abu/vdbdata/it/knn_vdb/index.pkl", "rb") as f:
-    docstore, index_to_docstore_id = pickle.load(f)
+a=torch.tensor([1,2,3,4]).to('cuda')
 
-    print(index_to_docstore_id[0])
+mask = a!=1
+
+b=a[mask]
+c=torch.tensor([1,2,3,4])
+d=torch.cat((c,a))
+import pdb
+pdb.set_trace()
