@@ -332,16 +332,3 @@ class LLaMAEmbedding:
         # print(query_embedding,query_embedding.shape)
 
         return query_embedding.to(torch.float)
-
-    # def mean_pooling(self,model_output, attention_mask):
-    #     """
-    #     本来参数是model_output，但是我在外面抽出了最后一层状态，这样有很大的问题，因为这里依赖于attention矩阵！好在这个正则化相当于自身的归一。
-    #     之所以需要这一步，是因为pad位置的输出还不一样，而且也不是0，为了消除这个影响，只能手动对他们置于0
-    #     """
-    #     token_embeddings = model_output.last_hidden_state  # First element of model_output contains all token embeddings
-    #     # 这个操作使得mask和embedding是一个维度了，本来一个是bsz x seqlen x hdz，mask是bsz x seqlen的，unsqueeze之后就是bsz x seqlen x1
-    #     # 然后在最后一维复制hdz次，转成float是因为下面要运算
-    #     input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-    #     # 需要被mask掉的位置就会失去他的光辉，沿着句长维度求和。clamp是把数压缩在min，max之间，也是沿着句长维度求和，
-    #     # 之所以min取了一个数字，是因为全0的问题？或者下溢出？
-    #     return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)

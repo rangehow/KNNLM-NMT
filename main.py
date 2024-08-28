@@ -13,7 +13,7 @@ def parse_main_args():
     parser = argparse.ArgumentParser(description="Multi-stage processing program.")
     parser.add_argument(
         "stage",
-        choices=["create_index", "process_data", "analyze_results"],
+        choices=["create_index", "generate", "analyze_results"],
         help="Specify which stage to run",
     )
     return parser.parse_known_args()
@@ -25,6 +25,20 @@ def parse_create_index_args(args):
     parser.add_argument(
         "--domain", type=str, help="The field to be indexed", default="koran"
     )
+    parser.add_argument(
+        "--vdb_type",
+        type=str,
+        default="base",
+        help="Define which LLM to be used as embedding model",
+    )
+    parser.add_argument("--prompt_type", type=str, help="Type of prompt to use")
+    return parser.parse_args(args)
+
+
+def parse_create_index_args(args):
+    """Parse arguments specific to the create_index stage."""
+    parser = argparse.ArgumentParser(description="Create index stage.")
+
     parser.add_argument(
         "--vdb_type",
         type=str,
@@ -67,10 +81,20 @@ def create_index(args):
     # Implementation here
 
 
-def process_data():
+def nmt_with_lm(args):
     """Process data stage implementation."""
     print("Processing data...")
     # Implementation here
+    from transformers import AutoModelForSeq2SeqLM, AutoModelForCausalLM
+    from knn_lm import KNNWrapper
+
+    nmt_model = AutoModelForSeq2SeqLM.from_pretrained(
+        config.nmt_path, torch_dtype="auto"
+    )
+    llama = AutoModelForCausalLM.from_pretrained(
+        config.llama_path[args.vdb_type], torch_dtype="auto"
+    )
+    nmt_model = KNNWrapper.break_into(nmt_model, assistant_model=llama)
 
 
 def analyze_results():
@@ -84,7 +108,7 @@ def main():
     args, unknown = parse_main_args()
     stage_functions = {
         "create_index": create_index,
-        "process_data": process_data,
+        "generate": nmt_with_lm,
         "analyze_results": analyze_results,
     }
 

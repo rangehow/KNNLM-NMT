@@ -106,7 +106,7 @@ class KNNWrapper(object):
 
     def break_into(self, model, assistant_model=None,domain=None,vdb_type=None):
         self.model = model
-        self.assistant_model = assistant_model  # 辅助模型主要是需要获取
+        self.assistant_model = assistant_model  
         model.broken_into = True
         self.setup_faiss(domain=domain,vdb_type=vdb_type)
         self.is_encoder_decoder = model.config.is_encoder_decoder
