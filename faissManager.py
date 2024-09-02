@@ -1,4 +1,5 @@
 """Wrapper around FAISS vector database."""
+
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -24,15 +25,14 @@ from typing import (
 import copy
 import numpy as np
 import time
+
 # from langchain.docstore.base import AddableMixin, Docstore
 # from langchain.docstore.document import Document
 # from langchain.docstore.in_memory import InMemoryDocstore
 # from langchain.embeddings.base import Embeddings
 from langchain.vectorstores.base import VectorStore
+
 # from langchain.vectorstores.utils import DistanceStrategy, maximal_marginal_relevance
-
-
-
 
 
 def dependable_faiss_import(no_avx2: Optional[bool] = None) -> Any:
@@ -61,6 +61,7 @@ def dependable_faiss_import(no_avx2: Optional[bool] = None) -> Any:
         )
     return faiss
 
+
 def _len_check_if_sized(x: Any, y: Any, x_name: str, y_name: str) -> None:
     """
     相当于一个assert断言加提示了，要求x和y是等长的。
@@ -71,6 +72,7 @@ def _len_check_if_sized(x: Any, y: Any, x_name: str, y_name: str) -> None:
             f"len({x_name})={len(x)} and len({y_name})={len(y)}"
         )
     return
+
 
 def cosine_similarity(X, Y) -> np.ndarray:
     """Row-wise cosine similarity between two equal-width matrices."""
@@ -91,7 +93,6 @@ def cosine_similarity(X, Y) -> np.ndarray:
         similarity = np.dot(X, Y.T) / np.outer(X_norm, Y_norm)
     similarity[np.isnan(similarity) | np.isinf(similarity)] = 0.0
     return similarity
-
 
 
 def maximal_marginal_relevance(
@@ -127,6 +128,7 @@ def maximal_marginal_relevance(
         selected = np.append(selected, [embedding_list[idx_to_add]], axis=0)
     return idxs
 
+
 class DistanceStrategy(str, Enum):
     """Enumerator of the Distance strategies for calculating distances
     between vectors."""
@@ -136,15 +138,18 @@ class DistanceStrategy(str, Enum):
     DOT_PRODUCT = "DOT_PRODUCT"
     JACCARD = "JACCARD"
     COSINE = "COSINE"
+
+
 class Document:
     """Class for storing a piece of text and associated metadata."""
 
     page_content: str
     """String text."""
-    metadata: dict 
+    metadata: dict
     """Arbitrary metadata about the page content (e.g., source, relationships to other
         documents, etc.).
     """
+
 
 class InMemoryDocstore:
     """Simple in memory docstore in the form of a dict."""
@@ -230,13 +235,13 @@ class FAISS(VectorStore):
         docstore: InMemoryDocstore,
         index_to_docstore_id: Dict[int, str],
         relevance_score_fn: Optional[Callable[[float], float]] = None,
-        normalize_L2: bool = False, # 这里本来是false的，这个主要是search的时候用来操纵query的归一化行为的
+        normalize_L2: bool = False,  # 这里本来是false的，这个主要是search的时候用来操纵query的归一化行为的
         distance_strategy: DistanceStrategy = DistanceStrategy.EUCLIDEAN_DISTANCE,
         maxNorm=None,
         # distance_strategy: DistanceStrategy = DistanceStrategy.COSINE,
     ):
         """Initialize with necessary components."""
-        
+
         self.embedding_function = embedding_function
         self.index = index
         self.docstore = docstore
@@ -244,7 +249,7 @@ class FAISS(VectorStore):
         self.distance_strategy = distance_strategy
         self.override_relevance_score_fn = relevance_score_fn
         self._normalize_L2 = normalize_L2
-        self.maxNorm=maxNorm
+        self.maxNorm = maxNorm
         if (
             self.distance_strategy != DistanceStrategy.EUCLIDEAN_DISTANCE
             and self._normalize_L2
@@ -296,7 +301,6 @@ class FAISS(VectorStore):
         _len_check_if_sized(documents, ids, "documents", "ids")
 
         # Add to the index.
-
 
         vector = np.array(embeddings, dtype=np.float32)
         if self._normalize_L2:
@@ -357,7 +361,7 @@ class FAISS(VectorStore):
         **kwargs: Any,
     ) -> List[str]:
         """Run more texts through the embeddings and add to the vectorstore.
-        
+
         Args:
             text_embeddings: Iterable pairs of string and embedding to
                 add to the vectorstore.
@@ -402,17 +406,17 @@ class FAISS(VectorStore):
             in float for each. Lower score represents more similarity.
         """
         # 也是危险操作
-        embeddingNorm=torch.norm(embedding,dim=-1,p=2)
+        embeddingNorm = torch.norm(embedding, dim=-1, p=2)
 
         # 这样写可以支持批量查询
-        if all(torch.ge(embeddingNorm,1)):
+        if all(torch.ge(embeddingNorm, 1)):
             # print('?')
-            embedding/=self.maxNorm
+            embedding /= self.maxNorm
             # print(f'查询向量经过{self.maxNorm}归一化前范数是{embeddingNorm}，现在是{torch.norm(embedding,dim=-1,p=2)}')
 
         faiss = dependable_faiss_import()
 
-        if len(embedding.shape)<2:
+        if len(embedding.shape) < 2:
             vector = np.array([embedding], dtype=np.float32)
         else:
             vector = np.array(embedding, dtype=np.float32)
@@ -420,13 +424,13 @@ class FAISS(VectorStore):
         # print(vector.shape)
         # print(vector)
         # if self._normalize_L2:
-        if getattr(kwargs,'normalize_L2',False):
-            print('危险操作，faissManager里将要对问题做normalize_L2')
+        if getattr(kwargs, "normalize_L2", False):
+            print("危险操作，faissManager里将要对问题做normalize_L2")
             faiss.normalize_L2(vector)
-        start=time.time()
+        start = time.time()
         scores, indices = self.index.search(vector, k if filter is None else fetch_k)
         # print(scores,indices)
-        end=time.time()
+        end = time.time()
         # print('faiss search time',end-start)
         # print('scores:',scores)
         batch_docs = []
@@ -435,7 +439,7 @@ class FAISS(VectorStore):
         # 搞什么飞机啊为什么只取indices[0]?
         # 改了,不然不支持batch搜索
         for b in range(len(indices)):
-            docs=[]
+            docs = []
             # for j, i in enumerate(indices[0]):
             for j, i in enumerate(indices[b]):
                 if i == -1:
@@ -450,7 +454,9 @@ class FAISS(VectorStore):
                         key: [value] if not isinstance(value, list) else value
                         for key, value in filter.items()
                     }
-                    if all(doc.metadata.get(key) in value for key, value in filter.items()):
+                    if all(
+                        doc.metadata.get(key) in value for key, value in filter.items()
+                    ):
                         docs.append((doc, scores[b][j]))
                 else:
                     docs.append((doc, scores[b][j]))
@@ -468,13 +474,13 @@ class FAISS(VectorStore):
                 else operator.le
             )
             for batch_idx in range(len(batch_docs)):
-                
+
                 batch_docs[batch_idx] = [
                     (doc, similarity)
                     for doc, similarity in batch_docs[batch_idx]
                     if cmp(similarity, score_threshold)
                 ]
-        
+
         # return docs[:k]
         # NOTE 不太清楚这里为什么还要保留前k个,但是会影响batch的召回
         return batch_docs
@@ -485,11 +491,10 @@ class FAISS(VectorStore):
         k: int = 4,
         filter: Optional[Dict[str, Any]] = None,
         fetch_k: int = 20,
-        multiR =False,
+        multiR=False,
         history_embedding=None,
         check_mode=False,
         **kwargs: Any,
-        
     ) -> List[Tuple[Document, float]]:
         """Return docs most similar to query.
 
@@ -507,7 +512,6 @@ class FAISS(VectorStore):
 
         sentence_embedding = self.embedding_function(query).to("cpu")
 
-
         batch_docs = self.similarity_search_with_score_by_vector(
             sentence_embedding,
             k,
@@ -515,7 +519,6 @@ class FAISS(VectorStore):
             fetch_k=fetch_k,
             **kwargs,
         )
-
 
         return batch_docs
 
@@ -573,11 +576,21 @@ class FAISS(VectorStore):
         """
 
         batch_docs_and_scores = self.similarity_search_with_score(
-                query, k, filter=filter, fetch_k=fetch_k,multiR=multiR,history_embedding=history_embedding,check_mode=check_mode, **kwargs
-            )
+            query,
+            k,
+            filter=filter,
+            fetch_k=fetch_k,
+            multiR=multiR,
+            history_embedding=history_embedding,
+            check_mode=check_mode,
+            **kwargs,
+        )
 
         # 现在这里返回的很抽象,是一个bsz with docs and scores的东西
-        return [[doc for doc, _ in docs_and_scores] for docs_and_scores in batch_docs_and_scores]
+        return [
+            [doc for doc, _ in docs_and_scores]
+            for docs_and_scores in batch_docs_and_scores
+        ]
 
     def max_marginal_relevance_search_with_score_by_vector(
         self,
@@ -622,9 +635,11 @@ class FAISS(VectorStore):
                 if not isinstance(doc, Document):
                     raise ValueError(f"Could not find document for id {_id}, got {doc}")
                 if all(
-                    doc.metadata.get(key) in value
-                    if isinstance(value, list)
-                    else doc.metadata.get(key) == value
+                    (
+                        doc.metadata.get(key) in value
+                        if isinstance(value, list)
+                        else doc.metadata.get(key) == value
+                    )
                     for key, value in filter.items()
                 ):
                     filtered_indices.append(i)
@@ -790,7 +805,7 @@ class FAISS(VectorStore):
         cls,
         texts: List[str],
         embeddings: List[List[float]],
-        embedding: Embeddings, 
+        embedding: Embeddings,
         metadatas: Optional[List[dict]] = None,
         ids: Optional[List[str]] = None,
         normalize_L2: bool = False,
@@ -939,14 +954,14 @@ class FAISS(VectorStore):
         cls,
         documents: dict,
         embedding: Embeddings,
-        tensorSaveDir:str,
-        qa:bool=False,
-        query_document:List[str]=None,
-        reuse:bool=False,
+        tensorSaveDir: str,
+        qa: bool = False,
+        query_document: List[str] = None,
+        reuse: bool = False,
         metadatas: Optional[List[dict]] = None,
         ids: Optional[List[str]] = None,
-        index_type:str="IVF10_HNSW32,FlatDedup",
-        efSearch=128, 
+        index_type: str = "IVF10_HNSW32,FlatDedup",
+        efSearch=128,
         do_max_norm=True,
         normalize_L2: bool = False,
         # d=768, 不要这个参数了，直接用模型的
@@ -970,17 +985,20 @@ class FAISS(VectorStore):
                 embeddings = OpenAIEmbeddings()
                 faiss = FAISS.from_texts(texts, embeddings)
         """
-        
-        assert not (normalize_L2 and do_max_norm),'不能同时做l2和最大norm，没啥意义啊感觉'
+
+        assert not (
+            normalize_L2 and do_max_norm
+        ), "不能同时做l2和最大norm，没啥意义啊感觉"
         # 获取embedding区域+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-        texts =  documents
+        texts = documents
         metadatas = None
         # 如果qa开启了，则必须有查询的文本
-        assert (qa and query_document is not None) or not (qa and query_document is not None),f"{qa} & {query_document}"
+        assert (qa and query_document is not None) or not (
+            qa and query_document is not None
+        ), f"{qa} & {query_document}"
         if qa:
-            query_texts=[d.page_content for d in query_document]
-        
-        
+            query_texts = [d.page_content for d in query_document]
+
         # 过滤长文本++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
         # 这里疑似有问题
         # pop_cnt=0
@@ -1000,27 +1018,28 @@ class FAISS(VectorStore):
         # print(f'根据长度弹出了{pop_cnt}个数据')
         # ------------------------------------------------------------------------------------------------
 
-        
-        print(len(texts),max(len(x) for x in texts))
-        
+        print(len(texts), max(len(x) for x in texts))
+
         # 编码文档++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
         if not reuse:
             if not qa:
                 # # 接入自己的embedding模型: ) ,我还返回了norm
-                embeddings,maxNorm = embedding.embed_documents(texts)
-               
+                embeddings, maxNorm = embedding.embed_documents(texts)
+
             else:
-                print('编码query中')
-                embeddings,maxNorm = embedding.embed_documents(query_texts)
-                
+                print("编码query中")
+                embeddings, maxNorm = embedding.embed_documents(query_texts)
+
         # print(embeddings,maxNorm)
         # print(texts)
         # --------------------------------------------------------------------------------------------------
 
         # 按最大范数做归一化+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-        if torch.max(torch.norm(embeddings,dim=1)) >1 and do_max_norm:
-            embeddings/=maxNorm
-            print(f'自己编码的向量最大范数原本是{maxNorm},现在变成了{torch.max(torch.norm(embeddings,dim=1))}')
+        if torch.max(torch.norm(embeddings, dim=1)) > 1 and do_max_norm:
+            embeddings /= maxNorm
+            print(
+                f"自己编码的向量最大范数原本是{maxNorm},现在变成了{torch.max(torch.norm(embeddings,dim=1))}"
+            )
         # ------------------------------------------------------------------------------------------------------
 
         # 保存/从磁盘加载++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -1045,10 +1064,11 @@ class FAISS(VectorStore):
         # ------------------------------------------------------------------------------------------------------------------------------
 
         import faiss
-        if index_type !='Flat':
+
+        if index_type != "Flat":
             index = faiss.index_factory(embeddings.shape[-1], index_type)
-            index.efSearch=efSearch
-            index.nprobe=nprobe
+            index.efSearch = efSearch
+            index.nprobe = nprobe
             vector = np.array(embeddings, dtype=np.float32)
             if normalize_L2:
                 faiss.normalize_L2(vector)
@@ -1056,17 +1076,20 @@ class FAISS(VectorStore):
             # # 中间的是gpuid，我默认加载到0卡上√
             # index = faiss.index_cpu_to_gpu(res, 1,index)
             index.train(vector)
-            print('faissManager.py: INDEX 训练完成了')
+            print("faissManager.py: INDEX 训练完成了")
             index.add(vector)
-            print('faissManager.py: 数据已添加到索引当中，索引现有元素',index.ntotal)
+            print("faissManager.py: 数据已添加到索引当中，索引现有元素", index.ntotal)
         else:
             index = faiss.IndexFlatL2(embeddings.shape[-1])
             vector = np.array(embeddings, dtype=np.float32)
             if normalize_L2:
-                faiss.normalize_L2(vector)  
+                faiss.normalize_L2(vector)
             index.add(vector)
-            print('faissManager.py: 该索引类型不需要训练，数据已添加到索引当中，索引现有元素',index.ntotal)
-        
+            print(
+                "faissManager.py: 该索引类型不需要训练，数据已添加到索引当中，索引现有元素",
+                index.ntotal,
+            )
+
         # 和langchain交互++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
         documents = []
         # 创建文档数量的uuid，那么下面应该要维护一个uuid2text的字典了，不然没法直接从text里取，为啥不直接顺序range啊
@@ -1092,23 +1115,22 @@ class FAISS(VectorStore):
             index_to_id,
             maxNorm=maxNorm,
             **kwargs,
-        )    
-    
+        )
+
     @classmethod
     def build_knn_datastore(
         cls,
         documents: list[dict],
         embedding: Embeddings,
-        tensorSaveDir:str,
+        tensorSaveDir: str,
         metadatas: Optional[List[dict]] = None,
         ids: Optional[List[str]] = None,
         # index_type:str="IVF10_HNSW32,Flat",
         # index_type:str="Flat",
-        index_type:str="IVF256_HNSW32,SQ8",
-        efSearch=128, 
+        index_type: str = "IVF256_HNSW32,SQ8",
+        efSearch=128,
         do_max_norm=True,
         normalize_L2: bool = False,
-        # d=768, 不要这个参数了，直接用模型的
         nprobe=128,
         vdb_type=None,
         **kwargs: Any,
@@ -1130,22 +1152,20 @@ class FAISS(VectorStore):
                 embeddings = OpenAIEmbeddings()
                 faiss = FAISS.from_texts(texts, embeddings)
         """
-        
-        
-        
-    
-      
-        embeddings,texts,maxNorm = embedding.embed_documents(documents)
+
+        embeddings, texts, maxNorm = embedding.embed_documents(documents)
         # print(embeddings)
-              
+
         # print(embeddings,maxNorm)
         # print(texts)
         # --------------------------------------------------------------------------------------------------
 
         # 按最大范数做归一化+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-        if torch.max(torch.norm(embeddings,dim=1)) >1 and do_max_norm:
-            embeddings/=maxNorm
-            print(f'自己编码的向量最大范数原本是{maxNorm},现在变成了{torch.max(torch.norm(embeddings,dim=1))}')
+        if torch.max(torch.norm(embeddings, dim=1)) > 1 and do_max_norm:
+            embeddings /= maxNorm
+            print(
+                f"自己编码的向量最大范数原本是{maxNorm},现在变成了{torch.max(torch.norm(embeddings,dim=1))}"
+            )
         # ------------------------------------------------------------------------------------------------------
         # print(embeddings,'??')
         # 保存/从磁盘加载++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -1175,51 +1195,58 @@ class FAISS(VectorStore):
         # maxNorm=torch.load('/data/lxy/abu/vdbdata/it/knn_vdb/maxNorm.pt')
         # print(f'原本复用的张量最大范数是{torch.max(torch.norm(embeddings,dim=1))}')
         import faiss
-        if index_type !='Flat':
+
+        if index_type != "Flat":
             index = faiss.index_factory(embeddings.shape[-1], index_type)
-            index.efSearch=efSearch
-            index.nprobe=nprobe
+            index.efSearch = efSearch
+            index.nprobe = nprobe
             vector = np.array(embeddings, dtype=np.float32)
             if normalize_L2:
                 faiss.normalize_L2(vector)
-            start=time.time()
-            
+            start = time.time()
+
             # res = faiss.StandardGpuResources()
             # # 中间的是gpuid，我默认加载到0卡上√
             # index = faiss.index_cpu_to_gpu(res, 1,index)
-            
+
             index.train(vector)
-            print('faissManager.py: INDEX 训练完成了')
-            end=time.time()
+            print("faissManager.py: INDEX 训练完成了")
+            end = time.time()
             try:
-                print('cpu训练时间',end-start)
+                print("cpu训练时间", end - start)
             except Exception as e:
                 print(e)
             index.add(vector)
-            print('faissManager.py: 数据已添加到索引当中，索引现有元素',index.ntotal)
+            print("faissManager.py: 数据已添加到索引当中，索引现有元素", index.ntotal)
         else:
             index = faiss.IndexFlatL2(embeddings.shape[-1])
             vector = np.array(embeddings, dtype=np.float32)
             if normalize_L2:
-                faiss.normalize_L2(vector)  
+                faiss.normalize_L2(vector)
             index.add(vector)
-            print('faissManager.py: 该索引类型不需要训练，数据已添加到索引当中，索引现有元素',index.ntotal)
-        
+            print(
+                "faissManager.py: 该索引类型不需要训练，数据已添加到索引当中，索引现有元素",
+                index.ntotal,
+            )
+
         # 和langchain交互++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
         documents = []
         # 创建文档数量的uuid，那么下面应该要维护一个uuid2text的字典了，不然没法直接从text里取，为啥不直接顺序range啊
         if ids is None:
             ids = [str(uuid.uuid4()) for _ in texts]
-        
+
         from transformers import AutoTokenizer
         import config
-        tokenizer = AutoTokenizer.from_pretrained(config.llama_path[vdb_type],model_max_length=4096,add_eos_token=True)
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            config.llama_path[vdb_type], model_max_length=4096, add_eos_token=True
+        )
         # tokenizer.add_special_tokens({'pad_token': '[PAD]'})
         for i, text in enumerate(texts):
-            tempdict={}
-            tempdict['page_content']=int(text)
+            tempdict = {}
+            tempdict["page_content"] = int(text)
             # metadata = metadatas[i] if metadatas else {}
-            tempdict['metadata']=tokenizer.decode(int(text))
+            tempdict["metadata"] = tokenizer.decode(int(text))
             documents.append(tempdict)
         # 看来我还是太年轻了，确实要维护一个字典，不过他很聪明用了顺序id2uuid，这样字典会小很多，不过为什么不直接用顺序的id？
         index_to_id = dict(enumerate(ids))
@@ -1238,9 +1265,11 @@ class FAISS(VectorStore):
             index_to_id,
             maxNorm=maxNorm,
             **kwargs,
-        )    
+        )
 
-    def save_local(self, folder_path: str, index_name: str = "index",model_name='') -> None:
+    def save_local(
+        self, folder_path: str, index_name: str = "index", model_name=""
+    ) -> None:
         """Save FAISS index, docstore, and index_to_docstore_id to disk.
 
         Args:
@@ -1250,7 +1279,7 @@ class FAISS(VectorStore):
         """
         # 保存之前如果不把索引从GPU整到CPU会产生 don't know how to serialize this type of index错误
         faiss = dependable_faiss_import()
-        print('faissmanager 这里没问题')
+        print("faissmanager 这里没问题")
         self.index = faiss.index_gpu_to_cpu(self.index)
         path = Path(folder_path)
         path.mkdir(exist_ok=True, parents=True)
@@ -1265,16 +1294,16 @@ class FAISS(VectorStore):
         with open(path / "{index_name}.pkl".format(index_name=index_name), "wb") as f:
             pickle.dump((self.docstore, self.index_to_docstore_id), f)
 
-        torch.save(self.maxNorm,os.path.join(folder_path,'maxNorm.pt'))
+        torch.save(self.maxNorm, os.path.join(folder_path, "maxNorm.pt"))
 
-        if model_name!='':
-            torch.save(model_name,os.path.join(folder_path,'modelname.pt'))
+        if model_name != "":
+            torch.save(model_name, os.path.join(folder_path, "modelname.pt"))
 
     @classmethod
     def load_local(
         cls,
         folder_path: str,
-        embeddings: Embeddings=None,
+        embeddings: Embeddings = None,
         index_name: str = "index",
         **kwargs: Any,
     ) -> FAISS:
@@ -1293,19 +1322,22 @@ class FAISS(VectorStore):
             str(path / "{index_name}.faiss".format(index_name=index_name))
         )
 
-        print('这个index里有这么多数据',index.ntotal)
+        print("这个index里有这么多数据", index.ntotal)
         index = faiss.index_cpu_to_gpu(faiss.StandardGpuResources(), 1, index)
-        
-        maxNorm=torch.load(os.path.join(folder_path,'maxNorm.pt'))
-        
+
+        maxNorm = torch.load(os.path.join(folder_path, "maxNorm.pt"))
+
         with open(path / "{index_name}.pkl".format(index_name=index_name), "rb") as f:
             docstore, index_to_docstore_id = pickle.load(f)
 
         return cls(
-            embeddings.embed_query, index, docstore, index_to_docstore_id, maxNorm=maxNorm,**kwargs
+            embeddings.embed_query,
+            index,
+            docstore,
+            index_to_docstore_id,
+            maxNorm=maxNorm,
+            **kwargs,
         )
-        
-        
 
     def serialize_to_bytes(self) -> bytes:
         """Serialize FAISS index, docstore, and index_to_docstore_id to bytes."""
@@ -1321,7 +1353,7 @@ class FAISS(VectorStore):
         """
         Deserialize FAISS index, docstore, and index_to_docstore_id from bytes.
         这个方法看起来能从本地读出pickle dumps的东西，但我还是持有一点
-        
+
         """
         index, docstore, index_to_docstore_id = pickle.loads(serialized)
         return cls(

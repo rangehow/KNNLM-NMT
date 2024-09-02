@@ -12,6 +12,7 @@ import faiss
 import faiss.contrib.torch_utils
 import torch.nn.functional as F
 import config
+
 logger = logging.getLogger(__name__)
 logger.setLevel(20)
 
@@ -50,7 +51,7 @@ class KNNWrapper(object):
         knn_temp=10,
         assistant_model=None,
         k=10,
-        vdb_type=None
+        vdb_type=None,
     ):
         self.embeddings = embeddings  # 只需要是类，不需要被实例化，实例化放到setup里面做。但这个其实只需要在存在辅助模型的时候才有用，如果是自己不需要。
         self.dstore_dir = dstore_dir
@@ -60,8 +61,8 @@ class KNNWrapper(object):
             KEY_TYPE.last_ffn_output if knn_keytype is None else knn_keytype
         )
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.k=k
-        self.vdb_type=vdb_type
+        self.k = k
+        self.vdb_type = vdb_type
 
         # lazy init
         self.model = None
@@ -74,7 +75,7 @@ class KNNWrapper(object):
         self.input_ids = None
         self.assistant_pastkv = None
 
-    def setup_faiss(self,domain,vdb_type):
+    def setup_faiss(self, domain, vdb_type):
         # 这个函数需要完成的是检索器的导入
         prefix = "Translate this from Deutsch to English:"
         shot = {
@@ -87,13 +88,14 @@ class KNNWrapper(object):
         prompt = prefix + shot[domain] + postfix
         # BUG 在我们的实验里，embedding本身什么是什么模型不太重要，因为我们会在外面安排额外的前向
         # 所以最后只利用里面db的直接搜索，不会传入一个字符串进去。所以这里随便设置一个就好了。
-        embeddings = self.embeddings(model=self.model,prompt=prompt,vdb_type=vdb_type)
+        embeddings = self.embeddings(model=self.model, prompt=prompt, vdb_type=vdb_type)
         self.retriever = knnretriver(index_dir=self.dstore_dir, embeddings=embeddings)
 
     def update_encoder_input(self, input_for_seq2seq_model):
         # seq2seq模型的encoder输入只能这么获取了，叹气
         self.input_ids = input_for_seq2seq_model.input_ids[:, :-1]
         beam_size = self.model.config.num_beams
+        # 采用束搜索的时候需要把bsz变成bbsz
         self.input_ids = torch.repeat_interleave(self.input_ids, beam_size, dim=0)
 
         # 其实这个是需要的，不然没法去掉pad部分
@@ -104,51 +106,54 @@ class KNNWrapper(object):
         # print(beam_size,input_for_seq2seq_model,self.input_ids,self.attention_mask)
         self.assistant_pastkv = None
 
-    def break_into(self, model, assistant_model=None,domain=None,vdb_type=None):
+    def break_into(self, model, assistant_model=None, domain=None, vdb_type=None):
         self.model = model
-        self.assistant_model = assistant_model  
+        self.assistant_model = assistant_model
         model.broken_into = True
-        self.setup_faiss(domain=domain,vdb_type=vdb_type)
+        self.setup_faiss(domain=domain, vdb_type=vdb_type)
         self.is_encoder_decoder = model.config.is_encoder_decoder
 
-        # NOTE 挂在整个模型最前面的钩子，用于捕获labels，
+        # NOTE 挂在整个模型最前面的钩子，用于捕获labels/decoder_input_ids之类的，可以根据需求改写
         self.original_forward_func = model.forward
         model.forward = self.pre_forward_hook
 
-        
         if self.assistant_model is None:
             # NOTE 其实这个地方如果只捕获last ffn output是可以和下面的钩子融合的，只是考虑到这里还能钩最后一个注意力层和ffn中间的那个激活值就分开了
             # 被获取的值放在 self.activation_capturer.captured里头
-            layer_to_capture_fn, capture_input,reverse = KNNWrapper.model_layer_to_capture[
-                model.config.model_type
-            ][self.knn_keytype]
+            layer_to_capture_fn, capture_input, reverse = (
+                KNNWrapper.model_layer_to_capture[model.config.model_type][
+                    self.knn_keytype
+                ]
+            )
             layer_to_capture = layer_to_capture_fn(model)
             self.activation_capturer = ActivationCapturer(
-                layer_to_capture, capture_input=capture_input,reverse=reverse
+                layer_to_capture, capture_input=capture_input, reverse=reverse
             )
             self.register_hook(layer_to_capture, self.activation_capturer)
         # 如果是assistant模式的话,这个钩子应该挂在assistant_model上
         else:
-            layer_to_capture_fn, capture_input,reverse = KNNWrapper.model_layer_to_capture[
-                assistant_model.config.model_type
-            ][self.knn_keytype]
+            layer_to_capture_fn, capture_input, reverse = (
+                KNNWrapper.model_layer_to_capture[assistant_model.config.model_type][
+                    self.knn_keytype
+                ]
+            )
             layer_to_capture = layer_to_capture_fn(assistant_model)
             self.activation_capturer = ActivationCapturer(
-                layer_to_capture, capture_input=capture_input,reverse=reverse
+                layer_to_capture, capture_input=capture_input, reverse=reverse
             )
             self.register_hook(layer_to_capture, self.activation_capturer)
 
-        # NOTE 一般情况下获取的是lm_head，如果不是的话需要自己改写这个函数
+        # NOTE 一般情况下获取的是lm_head，如果不是的话(例如fsmt模型的就不是)，需要自己改写这个函数
         final_layer = KNNWrapper.get_model_last_layer(model.config.model_type)(model)
         # 这个后钩子也要魔改,这块主要是搜knn和插值
         self.register_hook(final_layer, self.post_forward_hook)
         self.vocab_size = final_layer.out_features
 
-    def get_knns(self, queries, queries_is_str):
+    def get_knns(self, queries):
         start = time.time()
         # 如果query是str，就需要给检索器里的embedding编码，否则可以直接调db的检索。
-        if queries_is_str:
-            result = self.retriever.retrieve(queries,k=self.k)
+        if isinstance(queries, str):
+            result = self.retriever.retrieve(queries, k=self.k)
         else:
             result = self.retriever.db.similarity_search_with_score_by_vector(
                 queries.to(torch.float).to("cpu"), k=self.k
@@ -172,6 +177,7 @@ class KNNWrapper(object):
     def pre_forward_hook(
         self, input_ids=None, attention_mask=None, labels=None, **kwargs
     ):
+
         self.labels = labels
         self.decoder_input_ids = kwargs.get("decoder_input_ids", None)
         # print('self.decoder_input_ids',self.decoder_input_ids)
@@ -192,13 +198,11 @@ class KNNWrapper(object):
     ):
         # print('self.decoder_input_ids',self.decoder_input_ids)
         # decoder的输入不要第一个，因为那个是eos
-        real_input = torch.cat((self.input_ids, self.decoder_input_ids[:, 1:]), dim=1)
-        decoder_attn = torch.ones_like(self.decoder_input_ids[:, 1:])
-        real_attn = torch.cat((self.attention_mask, decoder_attn), dim=1)
+        real_input = self.decoder_input_ids[:, 1:]
         if self.assistant_pastkv is None:
-            return real_input, real_attn
+            return real_input
         else:
-            return real_input[:, -1:], real_attn
+            return real_input[:, -1:]
 
     def post_forward_hook(self, module, input, output):
         # print('input',input)
@@ -213,21 +217,22 @@ class KNNWrapper(object):
         # 这里需要安排一次辅助模型的前向
         if self.assistant_model is not None:
 
-            input_ids, attention_mask = self.preprare_input_for_assistant_model()
+            input_ids = self.preprare_input_for_assistant_model()
             from transformers import AutoTokenizer
 
-            llama_tokenizer = AutoTokenizer.from_pretrained(
-                config.llama_path[self.vdb_type],
-                use_fast=True,
-                padding_side="left",
-            )
-            llama_tokenizer.pad_token_id = 0
+            # debug use
+            # llama_tokenizer = AutoTokenizer.from_pretrained(
+            #     config.llama_path[self.vdb_type],
+            #     use_fast=True,
+            # )
+            # if llama_tokenizer.pad_token is None:
+            #     llama_tokenizer.pad_token = self.tokenizer.eos_token
+            # llama_tokenizer.padding_side = "left"
             # print('输入给llama的东西',llama_tokenizer.batch_decode(input_ids),)
             # if self.assistant_pastkv is not None:
             # print('self.assistant_pastkv.shape',len(self.assistant_pastkv),self.assistant_pastkv[0][0].shape)
             assistant_output = self.assistant_model(
                 input_ids=input_ids,
-                attention_mask=attention_mask,
                 use_cache=True,
                 past_key_values=self.assistant_pastkv,
                 return_dict=True,
@@ -237,8 +242,8 @@ class KNNWrapper(object):
         # 因为我已经设置了assistant模式挂在辅助模型上了,所以这里应该不需要修改
         queries = self.activation_capturer.captured  # (batch, time, dim)
 
+        # 先不用管这块
         if self.labels is None:
-            # 应该就是一个bsz\seqlen形状的东西
             nonpad_mask = torch.cat(
                 [
                     torch.zeros([batch, time_dim - 1], dtype=torch.bool),
@@ -257,7 +262,7 @@ class KNNWrapper(object):
                 axis=-1,
             )
 
-        # NOTE 我认为当labels不存在的时候,这个地方实际上是取了时间维度的最后一个,相当于lm_logits[:,-1,:]
+        # NOTE 当labels不存在的时候,这个地方实际上是取了时间维度的最后一个,相当于lm_logits[:,-1,:]
         # 验证了确实一样
         # print('debug',lm_logits.shape,output.shape,nonpad_mask.shape)
         lm_logits = lm_logits[nonpad_mask]
@@ -268,16 +273,8 @@ class KNNWrapper(object):
         else:
             queries = queries[:, -1, :]
 
-        # print(queries)
-        if self.assistant_model is None:
-            dists, knns = self.get_knns(
-                queries, queries_is_str=False
-            )  # (nonpad batch * time, k)
-        else:
-            # 主要我把辅助模型的前向安排在这个外面了
-            dists, knns = self.get_knns(
-                queries, queries_is_str=False
-            )
+        dists, knns = self.get_knns(queries)  # (nonpad batch * time, k)
+
         # print(dists,knns)
         neg_dists = -dists
         knn_log_probs, _ = self.knns_to_log_prob(knns, neg_dists)
@@ -289,9 +286,9 @@ class KNNWrapper(object):
         # print(output,interpolated_scores)
         # 因为有可能output来自nmt，那就是float，来自llama就是bf，所以直接根据output转变就行
         output[nonpad_mask] = interpolated_scores.to(output.dtype)
-        
+
         # debug------------------------------------------------------------
-        torch.set_printoptions(edgeitems =7)
+        torch.set_printoptions(edgeitems=7)
         # print('topk output',torch.topk(output,k=5,))
         # nonzero_indices=torch.nonzero(knn_log_probs)
         # print('torch.nonzero',nonzero_indices)
@@ -420,7 +417,11 @@ class KNNWrapper(object):
                 True,
                 False,
             ),
-            KEY_TYPE.last_ffn_output: (lambda model: model.base_model.norm, False,False,),
+            KEY_TYPE.last_ffn_output: (
+                lambda model: model.base_model.norm,
+                False,
+                False,
+            ),
         },
         "fsmt": {
             KEY_TYPE.last_ffn_input: (
@@ -431,18 +432,23 @@ class KNNWrapper(object):
                 lambda model: model.base_model.decoder.layers[-1].final_layer_norm,
                 False,
                 True,
-            )
+            ),
         },
-        
     }
 
 
 class ActivationCapturer(nn.Module):
-    def __init__(self, layer, capture_input=False,reverse=False):
+    """用于捕捉一个module的output，存储到self.captured里
+
+    Args:
+        nn (_type_): _description_
+    """
+
+    def __init__(self, layer, capture_input=False, reverse=False):
         super().__init__()
         self.layer = layer
         self.capture_input = capture_input
-        self.reverse=reverse
+        self.reverse = reverse
         self.captured = None
 
     def forward(self, module, input, output):
@@ -452,16 +458,18 @@ class ActivationCapturer(nn.Module):
         else:
             # 还挺麻烦的,一方面,模型的output本身是个tuple(tensor)
             # 里面的tensor可能因为束搜索变成很多个,like  bbsz x seq x 4096
-            if  isinstance(output,tuple): # NOTE 这里如果不挂在layer[-1]上,挂在那种layernorm上就不会是tuple,但为了泛化就先这么写吧
+            if isinstance(
+                output, tuple
+            ):  # NOTE 这里如果不挂在layer[-1]上,挂在那种layernorm上就不会是tuple,但为了泛化就先这么写吧
                 # print(len(output)) # fsmt这种应该是四个.x,self_attn_weights,layer_state(kv cache+k的padding mask),cross_attn_weights,
-                self.captured = output[0].detach() # 修改一下改成层输出就好
-                # print(output[0].shape) 
+                self.captured = output[0].detach()  # 修改一下改成层输出就好
+                # print(output[0].shape)
             else:
                 self.captured = output.detach()
-            
+
             # 我想啸,这个地方如果是fsmt,他是 seqlen x bbsz 和外面有冲突.
             if self.reverse:
-                self.captured=self.captured.transpose(0, 1) 
+                self.captured = self.captured.transpose(0, 1)
         end = time.time()
         # print('获取隐藏状态耗时',end-start)
 

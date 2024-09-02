@@ -1,9 +1,6 @@
 import numpy as np
 from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizerFast
 import torch
-import json
-import logging
-import warnings
 from typing import (
     Any,
     Callable,
@@ -18,17 +15,12 @@ from typing import (
 )
 from torch.utils.data import Dataset, DataLoader
 import copy
-
-
-# class documentDataset(Dataset):
-#     def __init__(self, document) -> None:
-#         self.data = document
-
-#     def __getitem__(self, index) -> Any:
-#         return self.data[index]
-
-#     def __len__(self):
-#         return len(self.data)
+from loguru import logger
+import config
+from load import balanced_load
+from torch.utils.data.sampler import Sampler
+import numpy as np
+from torch.utils.data import Sampler
 
 
 class TokenBatchDataset(Dataset):
@@ -46,54 +38,14 @@ class TokenBatchDataset(Dataset):
         return len(self.texts)
 
     def __getitem__(self, idx):
-        return self.texts[self.sorted_indices[idx]]
-
-
-from torch.utils.data.sampler import Sampler
-
-
-# class MaxTokenSampler(Sampler):
-#     def __init__(self, data, tokenizer) -> None:
-#         self.data = data
-#         self.max_token = 256
-#         self.idx = 0
-#         self.length = 0
-#         self.tokenizer = tokenizer
-
-#     def __len__(self) -> int:
-#         return self.length
-
-#     def __iter__(self):
-
-#         batch = []
-#         curLen = 0
-#         for i in range(self.idx, len(self.data)):
-#             prompt = (
-#                 "Translate this from Deutsch to English:\nDeutsch:{de}\nEnglish:{en}"
-#             )
-#             str = prompt.format_map(
-#                 {"en": self.data[i]["en"], "de": self.data[i]["de"]}
-#             )
-#             # print(self.tokenizer.encode(str))
-#             curLen += self.tokenizer(str, return_length=True)["length"][0]
-
-#             # 主要考虑自己一句话就超长了
-#             if len(batch) == 0 or curLen < self.max_token:
-#                 batch.append(i)
-#             else:
-#                 self.idx = i
-#                 assert len(batch) != 0, "第i个迭代返回空batch idx了?"
-#                 yield batch
-#                 curLen = self.tokenizer(str, return_length=True)["length"][0]
-#                 batch = [i]
-
-#         yield list(range(self.idx, len(self.data)))
+        # print(idx)
+        return self.texts[idx]
 
 
 class DynamicBatchSampler(Sampler):
     def __init__(self, dataset, max_tokens=256, min_len=1, random=False):
         self.dataset = dataset
-        self.max_tokens = max_tokens
+        self.max_tokens = int(max_tokens * 0.9)
         self.min_len = min_len
         self.random = random
         # 获取排序后的长度列表
@@ -103,41 +55,111 @@ class DynamicBatchSampler(Sampler):
         n = len(self.dataset)
         batches = []
         current_batch = []
-        current_length = 0
+        max_len_in_batch = 0
+        current_tokens = 0
+        i = 0
 
-        for i in range(n):
+        while i < n:
             idx = self.dataset.sorted_indices[i]
             length = self.lengths[i]
 
+            # 计算如果加入当前样本，整个batch的token数
+            new_max_len = max(max_len_in_batch, length)
+            new_batch_size = len(current_batch) + 1
+            new_total_tokens = (new_max_len + 1) * new_batch_size
+
             # 如果加入当前样本会超出最大token数，或者当前batch已经足够大
-            if current_length + length > self.max_tokens or len(current_batch) >= 512:
-                if current_batch:  # 确保不会添加空batch
+            if new_total_tokens > self.max_tokens or new_batch_size > 512:
+                if current_batch and len(current_batch) >= self.min_len:
+                    # fake_length=max(
+                    #     self.lengths[self.dataset.sorted_indices.index(i)]
+                    #     for i in current_batch
+                    # )
+                    # fake_total_tokens = fake_length* len(current_batch)
+                    # print(fake_length,fake_total_tokens)
+                    # import pdb
+
+                    # pdb.set_trace()
                     batches.append(current_batch)
-                current_batch = [idx]
-                current_length = length
+
+                    current_batch = []
+                    max_len_in_batch = 0
+                    current_tokens = 0
+                    # 不增加 i，再次尝试将当前实例添加到新的 batch
+                else:
+                    # 如果当前 batch 太小，强制添加当前实例
+                    current_batch.append(idx)
+                    max_len_in_batch = new_max_len
+                    current_tokens = new_total_tokens
+                    i += 1
             else:
                 current_batch.append(idx)
-                current_length += length
+                max_len_in_batch = new_max_len
+                current_tokens = new_total_tokens
+                i += 1
 
-            # 如果剩余的样本不足以形成一个新的batch，就将它们添加到当前batch
-            if i == n - 1 or self.lengths[i + 1] + current_length > self.max_tokens:
-                if len(current_batch) >= self.min_len:
-                    batches.append(current_batch)
-                current_batch = []
-                current_length = 0
+        if current_batch:
+            batches.append(current_batch)
 
         # 打乱batch的顺序
         if self.random:
             np.random.shuffle(batches)
 
         for batch in batches:
+            # total_tokens = (
+            #     max(self.lengths[self.dataset.sorted_indices.index(i)] for i in batch)
+            #     + 1
+            # ) * len(batch)
+
+            # logger.debug(f"sampler认为的长度是{total_tokens}")
+            # logger.debug(f"sampler吐出的下标是{batch}")
             yield batch
 
     def __len__(self):
         return len(list(self.__iter__()))
 
 
-import config
+import torch
+
+
+def find_max_tokens(model, initial_tokens=81, max_possible_tokens=8192 * 8):
+    lower_bound = initial_tokens
+    upper_bound = initial_tokens
+    max_tokens = initial_tokens
+
+    # 快速逼近上限阶段
+    while upper_bound <= max_possible_tokens:
+        try:
+            input_ids = torch.randint(100, 1000, (1, upper_bound)).to(model.device)
+            outputs = model(input_ids)
+            print(f"Successfully ran with {upper_bound} tokens")
+            max_tokens = upper_bound
+            lower_bound = upper_bound
+            upper_bound *= 2
+        except RuntimeError as e:
+            if "CUDA out of memory" in str(e):
+                print(f"CUDA out of memory at {upper_bound} tokens")
+                break
+            else:
+                raise e
+
+    # 精确搜索阶段（二分搜索）
+    while lower_bound <= upper_bound:
+        mid = (lower_bound + upper_bound) // 2
+        try:
+            input_ids = torch.randint(100, 1000, (1, mid)).to(model.device)
+            outputs = model(input_ids)
+            print(f"Successfully ran with {mid} tokens")
+            max_tokens = mid
+            lower_bound = mid + 1
+        except RuntimeError as e:
+            if "CUDA out of memory" in str(e):
+                print(f"CUDA out of memory at {mid} tokens")
+                upper_bound = mid - 1
+            else:
+                raise e
+
+    return max_tokens
 
 
 class LLaMAEmbedding:
@@ -145,22 +167,13 @@ class LLaMAEmbedding:
         self,
         model_name=config.llama_path,
         batch_size=4,
-        model=None,
         prompt=None,
         vdb_type=None,
         use_prompt=True,
     ):
-        if model is not None:
-            self.model = model
-        else:
-            self.model_name = model_name[vdb_type]
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_name[vdb_type], torch_dtype=torch.bfloat16, low_cpu_mem_usage=True
-            )
-        self.model.eval()
-        self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        self.model.to(self.device)
 
+        self.model = balanced_load(model_name[vdb_type])
+        # self.model.to_bettertransformer()
         self.tokenizer = AutoTokenizer.from_pretrained(model_name[vdb_type])
         self.tokenizer.padding_side = "left"
         # TODO 这个行为和旧实现可能有冲突，等下关注一下。
@@ -173,7 +186,7 @@ class LLaMAEmbedding:
         self.use_prompt = use_prompt
 
     def my_collate(self, batch):
-
+        # logger.debug(f"batch的数量是")
         # prompt='Translate this from Deutsch to English:\nDeutsch:{de}\nEnglish:{en}'
         if self.use_prompt:
             prompt = self.prompt
@@ -201,7 +214,11 @@ class LLaMAEmbedding:
         # print(len(texts),max(len(x) for x in texts))
 
         dataset = TokenBatchDataset(texts, self.tokenizer)
-        sampler = DynamicBatchSampler(dataset, max_tokens=256, min_len=2)
+        optimum_max_tokens = find_max_tokens(
+            self.model, initial_tokens=8192, max_possible_tokens=8192 * 2
+        )
+        logger.info(f"寻找到的batch最大token数量是{optimum_max_tokens}")
+        sampler = DynamicBatchSampler(dataset, max_tokens=optimum_max_tokens, min_len=1)
 
         dataloader = DataLoader(
             dataset,
@@ -226,6 +243,7 @@ class LLaMAEmbedding:
         for inputs, labels in data_loader_with_progress:
 
             with torch.no_grad():
+                # logger.debug(f"这个batch的token数量是：{inputs.input_ids.numel()}")
                 inputs.to(self.model.device)
                 labels.to(self.model.device)
 
@@ -267,7 +285,7 @@ class LLaMAEmbedding:
                 # return_list.append([(embedding,next_token) for next_token,embedding in zip(decoder_raw_token,model_output['decoder_hidden_states'])])
 
                 cnt += 1
-                if not cnt % 400:
+                if not cnt % 2:
                     temp_key = temp_key.to("cpu")
                     knn_embeddings = torch.cat((knn_embeddings, temp_key), dim=0)
                     temp_key = torch.empty(0, self.model.config.hidden_size).to("cuda")
@@ -322,7 +340,7 @@ class LLaMAEmbedding:
                     **encoded_input,
                     use_cache=False,
                     output_hidden_states=True,
-                    return_dict=True
+                    return_dict=True,
                 )
 
         # print(model_output['hidden_states'][-1],model_output['hidden_states'][-1].shape)
