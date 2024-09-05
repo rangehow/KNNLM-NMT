@@ -1,6 +1,6 @@
 # llama_path='/home/adu/llama2'
 vdb_path = "data/"
-nmt_path = "/data/lxy/abu/Llama_dict_NMT_hf"
+nmt_path = "/mnt/rangehow/models/hf_llama"
 vdb = {
     "base": "base_vdb",
     "chat": "chat_vdb",

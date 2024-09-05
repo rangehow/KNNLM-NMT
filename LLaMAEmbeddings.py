@@ -43,6 +43,11 @@ class TokenBatchDataset(Dataset):
 
 
 class DynamicBatchSampler(Sampler):
+    """要求与其配合的数据集存在sorted_indices以及lengths两个成员
+
+    Args:
+        Sampler (_type_): _description_
+    """
     def __init__(self, dataset, max_tokens=256, min_len=1, random=False):
         self.dataset = dataset
         self.max_tokens = int(max_tokens * 0.9)

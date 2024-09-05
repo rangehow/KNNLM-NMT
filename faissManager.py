@@ -406,20 +406,23 @@ class FAISS(VectorStore):
             in float for each. Lower score represents more similarity.
         """
         # 也是危险操作
-        embeddingNorm = torch.norm(embedding, dim=-1, p=2)
+        # embeddingNorm = torch.norm(embedding, dim=-1, p=2)
 
-        # 这样写可以支持批量查询
-        if all(torch.ge(embeddingNorm, 1)):
-            # print('?')
-            embedding /= self.maxNorm
-            # print(f'查询向量经过{self.maxNorm}归一化前范数是{embeddingNorm}，现在是{torch.norm(embedding,dim=-1,p=2)}')
+        # 感觉应该无论什么时候都直接除以才是正确的？因为是保序变换？但是这样过滤机制可能会比较麻烦，因为文档向量已经被我除过了
+        # embedding /= self.maxNorm
+        # # 这样写可以支持批量查询
+        # if all(torch.ge(embeddingNorm, 1)):
+        #     # print('?')
+        # embedding /= self.maxNorm
+        #     # print(f'查询向量经过{self.maxNorm}归一化前范数是{embeddingNorm}，现在是{torch.norm(embedding,dim=-1,p=2)}')
 
         faiss = dependable_faiss_import()
 
         if len(embedding.shape) < 2:
-            vector = np.array([embedding], dtype=np.float32)
+            vector = [embedding]
         else:
-            vector = np.array(embedding, dtype=np.float32)
+            vector = embedding
+
         # print(vector)
         # print(vector.shape)
         # print(vector)
@@ -427,17 +430,22 @@ class FAISS(VectorStore):
         if getattr(kwargs, "normalize_L2", False):
             print("危险操作，faissManager里将要对问题做normalize_L2")
             faiss.normalize_L2(vector)
-        start = time.time()
+
+
         scores, indices = self.index.search(vector, k if filter is None else fetch_k)
         # print(scores,indices)
-        end = time.time()
+
         # print('faiss search time',end-start)
         # print('scores:',scores)
         batch_docs = []
         # 2139  2142 15150  2159 34576
+        # print(indices)
+        # torch.cuda.synchronize()
 
-        # 搞什么飞机啊为什么只取indices[0]?
-        # 改了,不然不支持batch搜索
+        if isinstance(indices, torch.Tensor):
+            indices = indices.tolist()
+            # print(indices)
+
         for b in range(len(indices)):
             docs = []
             # for j, i in enumerate(indices[0]):
@@ -461,6 +469,7 @@ class FAISS(VectorStore):
                 else:
                     docs.append((doc, scores[b][j]))
             batch_docs.append(docs)
+
         # print(batch_docs,len(batch_docs))
         score_threshold = kwargs.get("score_threshold")
         # print(f"faissmanager.py:每个文档的相似性分数分别是：{[similarity for  doc, similarity in docs]}\n")
@@ -1323,7 +1332,7 @@ class FAISS(VectorStore):
         )
 
         print("这个index里有这么多数据", index.ntotal)
-        index = faiss.index_cpu_to_gpu(faiss.StandardGpuResources(), 1, index)
+        index = faiss.index_cpu_to_gpu(faiss.StandardGpuResources(), 0, index)
 
         maxNorm = torch.load(os.path.join(folder_path, "maxNorm.pt"))
 
@@ -1331,7 +1340,7 @@ class FAISS(VectorStore):
             docstore, index_to_docstore_id = pickle.load(f)
 
         return cls(
-            embeddings.embed_query,
+            embeddings.embed_query if embeddings else None,
             index,
             docstore,
             index_to_docstore_id,

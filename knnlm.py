@@ -1,6 +1,6 @@
 import os
 
-import logging
+
 import time
 import numpy as np
 import torch
@@ -13,8 +13,26 @@ import faiss.contrib.torch_utils
 import torch.nn.functional as F
 import config
 
-logger = logging.getLogger(__name__)
-logger.setLevel(20)
+from loguru import logger
+import sys
+
+logger.remove()
+logger.add(sys.stderr, level="INFO")
+
+
+def debug(logits, knns, outputs, tokenizer):
+    print("logits")
+    for logit in torch.topk(logits, k=5).indices:
+
+        print(tokenizer.convert_ids_to_tokens(logit))
+
+    print("knns")
+    for knn in knns:
+        print(tokenizer.convert_ids_to_tokens(knn))
+
+    print("outputs")
+    for output in torch.topk(outputs.squeeze(), k=5).indices:
+        print(tokenizer.convert_ids_to_tokens(output))
 
 
 class DIST(Enum):
@@ -45,22 +63,20 @@ class KNNWrapper(object):
     def __init__(
         self,
         dstore_dir,
-        embeddings=None,
         knn_keytype=None,
         lmbda=0.25,
         knn_temp=10,
         assistant_model=None,
         k=10,
+        tokenizer=None,
         vdb_type=None,
     ):
-        self.embeddings = embeddings  # 只需要是类，不需要被实例化，实例化放到setup里面做。但这个其实只需要在存在辅助模型的时候才有用，如果是自己不需要。
         self.dstore_dir = dstore_dir
         self.lmbda = lmbda
         self.knn_temperature = knn_temp
         self.knn_keytype = (
             KEY_TYPE.last_ffn_output if knn_keytype is None else knn_keytype
         )
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.k = k
         self.vdb_type = vdb_type
 
@@ -74,22 +90,12 @@ class KNNWrapper(object):
         self.assistant_model = None
         self.input_ids = None
         self.assistant_pastkv = None
+        self.tokenizer = tokenizer
 
-    def setup_faiss(self, domain, vdb_type):
+    def setup_faiss(self):
         # 这个函数需要完成的是检索器的导入
-        prefix = "Translate this from Deutsch to English:"
-        shot = {
-            "it": """\nDeutsch:Zeigt den aktuellen Wert der Feldvariable an.\nEnglish:Displays the current value of the field variable.\nDeutsch:In diesem Bereich wählen Sie die relativen Größen bezogen auf die Basisgröße.\nEnglish:In this section, you can determine the relative sizes for each type of element with reference to the base size.\nDeutsch:Geben Sie einen kurzen, beschreibenden Namen für die Schnittstelle ein.\nEnglish:Simply enter a short human-readable description for this device.""",
-            "koran": """\nDeutsch:So führt Gott (im Gleichnis) das Wahre und das Falsche an.\nEnglish:This is how God determines truth and falsehood.\nDeutsch:Da kamen sie auf ihn zu geeilt.\nEnglish:So the people descended upon him.\nDeutsch:Wir begehren von euch weder Lohn noch Dank dafür.\nEnglish:We wish for no reward, nor thanks from you.""",
-            "law": """\nDeutsch:Deshalb ist die Regelung von der Ausfuhrleistung abhängig.\nEnglish:In this regard, the scheme is contingent upon export performance.\nDeutsch:Das Mitglied setzt gleichzeitig den Rat von seinem Beschluß in Kenntnis.\nEnglish:That member shall simultaneously inform the Council of the action it has taken.\nDeutsch:Dies gilt auch für die vorgeschlagene Sicherheitsleistung.\nEnglish:The same shall apply as regards the security proposed.""",
-            "medical": """\nDeutsch:Das Virus wurde zuerst inaktiviert (abgetötet), damit es keine Erkrankungen verursachen kann.\nEnglish:This may help to protect against the disease caused by the virus.\nDeutsch:Desirudin ist ein rekombinantes DNS-Produkt, das aus Hefezellen hergestellt wird.\nEnglish:Desirudin is a recombinant DNA product derived from yeast cells.\nDeutsch:Katzen erhalten eine intramuskuläre Injektion.\nEnglish:In cats, it is given by intramuscular injection.""",
-        }
-        postfix = "\nDeutsch:{de}\nEnglish:{en}"
-        prompt = prefix + shot[domain] + postfix
-        # BUG 在我们的实验里，embedding本身什么是什么模型不太重要，因为我们会在外面安排额外的前向
-        # 所以最后只利用里面db的直接搜索，不会传入一个字符串进去。所以这里随便设置一个就好了。
-        embeddings = self.embeddings(model=self.model, prompt=prompt, vdb_type=vdb_type)
-        self.retriever = knnretriver(index_dir=self.dstore_dir, embeddings=embeddings)
+
+        self.retriever = knnretriver(index_dir=self.dstore_dir, embeddings=None)
 
     def update_encoder_input(self, input_for_seq2seq_model):
         # seq2seq模型的encoder输入只能这么获取了，叹气
@@ -106,18 +112,17 @@ class KNNWrapper(object):
         # print(beam_size,input_for_seq2seq_model,self.input_ids,self.attention_mask)
         self.assistant_pastkv = None
 
-    def break_into(self, model, assistant_model=None, domain=None, vdb_type=None):
-        self.model = model
-        self.assistant_model = assistant_model
+    def break_into(self, model, assistant_model=None):
+
         model.broken_into = True
-        self.setup_faiss(domain=domain, vdb_type=vdb_type)
+        self.setup_faiss()
         self.is_encoder_decoder = model.config.is_encoder_decoder
 
         # NOTE 挂在整个模型最前面的钩子，用于捕获labels/decoder_input_ids之类的，可以根据需求改写
         self.original_forward_func = model.forward
         model.forward = self.pre_forward_hook
 
-        if self.assistant_model is None:
+        if assistant_model is None:
             # NOTE 其实这个地方如果只捕获last ffn output是可以和下面的钩子融合的，只是考虑到这里还能钩最后一个注意力层和ffn中间的那个激活值就分开了
             # 被获取的值放在 self.activation_capturer.captured里头
             layer_to_capture_fn, capture_input, reverse = (
@@ -137,6 +142,7 @@ class KNNWrapper(object):
                     self.knn_keytype
                 ]
             )
+
             layer_to_capture = layer_to_capture_fn(assistant_model)
             self.activation_capturer = ActivationCapturer(
                 layer_to_capture, capture_input=capture_input, reverse=reverse
@@ -149,6 +155,12 @@ class KNNWrapper(object):
         self.register_hook(final_layer, self.post_forward_hook)
         self.vocab_size = final_layer.out_features
 
+        # self.model = model
+        # self.assistant_model = assistant_model
+
+        self.model = torch.compile(model)
+        self.assistant_model = torch.compile(assistant_model)
+
     def get_knns(self, queries):
         start = time.time()
         # 如果query是str，就需要给检索器里的embedding编码，否则可以直接调db的检索。
@@ -156,7 +168,7 @@ class KNNWrapper(object):
             result = self.retriever.retrieve(queries, k=self.k)
         else:
             result = self.retriever.db.similarity_search_with_score_by_vector(
-                queries.to(torch.float).to("cpu"), k=self.k
+                queries.to(torch.float32), k=self.k
             )
         # result是bsz x k x (2) ->0是document ,1是分数
         # print('result',result[0][0])
@@ -172,6 +184,7 @@ class KNNWrapper(object):
         end = time.time()
         # print('dists',dists)
         # print('检索耗时',end-start)
+        logger.debug(f"检索耗时,{end-start}")
         return torch.tensor(dists), torch.tensor(knns)
 
     def pre_forward_hook(
@@ -183,6 +196,7 @@ class KNNWrapper(object):
         # print('self.decoder_input_ids',self.decoder_input_ids)
         if self.assistant_model is not None:
             # nmt模型走generate的时候拿不到input_ids,因为会直接过encoder前处理成encoder_output
+
             self.decoder_input_ids = kwargs.get("decoder_input_ids", None)
 
         else:
@@ -196,9 +210,23 @@ class KNNWrapper(object):
     def preprare_input_for_assistant_model(
         self,
     ):
+
+        if self.decoder_input_ids.shape[1] == 1:
+
+            self.assistant_pastkv = (
+                None  # 这是第一次时间步，需要清空里面的cache！不同batch之间会有干扰
+            )
         # print('self.decoder_input_ids',self.decoder_input_ids)
         # decoder的输入不要第一个，因为那个是eos
-        real_input = self.decoder_input_ids[:, 1:]
+        bos_tensor = torch.tensor(
+            self.tokenizer.bos_token_id, dtype=int, device=self.assistant_model.device
+        ).repeat(self.decoder_input_ids.shape[0], 1)
+
+        real_input = torch.cat(
+            (bos_tensor, self.decoder_input_ids[:, 1:].to(self.assistant_model.device)),
+            dim=-1,
+        )
+
         if self.assistant_pastkv is None:
             return real_input
         else:
@@ -206,7 +234,7 @@ class KNNWrapper(object):
 
     def post_forward_hook(self, module, input, output):
         # print('input',input)
-        start = time.time()
+
         batch, time_dim, vocab_size = output.shape
         shift = 0 if self.is_encoder_decoder else 1
         lm_logits = output
@@ -215,22 +243,30 @@ class KNNWrapper(object):
         )  # (batch, time, vocab)
 
         # 这里需要安排一次辅助模型的前向
+        start = time.time()
         if self.assistant_model is not None:
 
             input_ids = self.preprare_input_for_assistant_model()
             from transformers import AutoTokenizer
 
             # debug use
-            # llama_tokenizer = AutoTokenizer.from_pretrained(
-            #     config.llama_path[self.vdb_type],
-            #     use_fast=True,
+            llama_tokenizer = AutoTokenizer.from_pretrained(
+                config.llama_path["chat"],
+                use_fast=True,
+            )
+            if llama_tokenizer.pad_token is None:
+                llama_tokenizer.pad_token = llama_tokenizer.eos_token
+            llama_tokenizer.padding_side = "left"
+            # print(
+            #     "输入给llama的东西",
+            #     llama_tokenizer.batch_decode(input_ids),
             # )
-            # if llama_tokenizer.pad_token is None:
-            #     llama_tokenizer.pad_token = self.tokenizer.eos_token
-            # llama_tokenizer.padding_side = "left"
-            # print('输入给llama的东西',llama_tokenizer.batch_decode(input_ids),)
             # if self.assistant_pastkv is not None:
-            # print('self.assistant_pastkv.shape',len(self.assistant_pastkv),self.assistant_pastkv[0][0].shape)
+            # print(
+            #     "self.assistant_pastkv.shape",
+            #     len(self.assistant_pastkv),
+            #     self.assistant_pastkv[0][0].shape,
+            # )
             assistant_output = self.assistant_model(
                 input_ids=input_ids,
                 use_cache=True,
@@ -239,6 +275,8 @@ class KNNWrapper(object):
             )
             # print('logits',assistant_output['logits'])
             self.assistant_pastkv = assistant_output["past_key_values"]
+        end = time.time()
+        logger.debug(f"輔助模型前向耗時：{end-start}")
         # 因为我已经设置了assistant模式挂在辅助模型上了,所以这里应该不需要修改
         queries = self.activation_capturer.captured  # (batch, time, dim)
 
@@ -250,13 +288,13 @@ class KNNWrapper(object):
                     torch.ones([batch, 1], dtype=torch.bool),
                 ],
                 axis=-1,
-            ).to(self.device)
+            ).to(self.model.device)
         else:
             nonpad_mask = torch.cat(
                 [
                     self.labels[:, shift:] != -100,
                     torch.zeros([self.labels.shape[0], shift], dtype=torch.bool).to(
-                        self.device
+                        self.model.device
                     ),
                 ],
                 axis=-1,
@@ -265,6 +303,7 @@ class KNNWrapper(object):
         # NOTE 当labels不存在的时候,这个地方实际上是取了时间维度的最后一个,相当于lm_logits[:,-1,:]
         # 验证了确实一样
         # print('debug',lm_logits.shape,output.shape,nonpad_mask.shape)
+
         lm_logits = lm_logits[nonpad_mask]
         # print('debug',lm_logits)
 
@@ -275,7 +314,8 @@ class KNNWrapper(object):
 
         dists, knns = self.get_knns(queries)  # (nonpad batch * time, k)
 
-        # print(dists,knns)
+        start2 = time.time()
+
         neg_dists = -dists
         knn_log_probs, _ = self.knns_to_log_prob(knns, neg_dists)
         # print('lm_logits',torch.topk(lm_logits,k=5))
@@ -286,18 +326,21 @@ class KNNWrapper(object):
         # print(output,interpolated_scores)
         # 因为有可能output来自nmt，那就是float，来自llama就是bf，所以直接根据output转变就行
         output[nonpad_mask] = interpolated_scores.to(output.dtype)
-
         # debug------------------------------------------------------------
         torch.set_printoptions(edgeitems=7)
-        # print('topk output',torch.topk(output,k=5,))
-        # nonzero_indices=torch.nonzero(knn_log_probs)
-        # print('torch.nonzero',nonzero_indices)
-        # print(nonzero_indices.shape)
-        # print('non zero value',knn_log_probs[nonzero_indices[:, 0], nonzero_indices[:, 1]])
-        # print('output.shape',output.shape)
-        end = time.time()
-        # print('后钩子耗时',end-start)
+        # debug(logits=lm_logits, knns=knns, outputs=output, tokenizer=self.tokenizer)
 
+        # nonzero_indices = torch.nonzero(knn_log_probs)
+        # print("torch.nonzero", nonzero_indices)
+        # print(nonzero_indices.shape)
+        # print(
+        #     "non zero value",
+        #     knn_log_probs[nonzero_indices[:, 0], nonzero_indices[:, 1]],
+        # )
+        # print("output.shape", output.shape)
+        end2 = time.time()
+        # print('后钩子耗时',end-start)
+        logger.debug(f"后钩子的后处理耗时：{end2-start2}")
         return output
 
     def knns_to_log_prob(self, knns, neg_dists):
@@ -312,7 +355,7 @@ class KNNWrapper(object):
                 size=(vals_at_knns.shape[:-1] + (self.vocab_size,)), fill_value=0.0
             )
             .scatter_add(dim=-1, index=vals_at_knns, src=probs)
-            .to(self.device)
+            .to(self.model.device)
             .log()
         )  # (nonpad_batch * time, vocab)
         knn_log_probs = torch.nan_to_num(knn_log_probs, nan=None, neginf=-10000.0)

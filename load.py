@@ -1,9 +1,28 @@
+import accelerate
+from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM
+import math
+from torch.cuda import device_count
+
+
+model_type2lm_head_modules = {
+    "fsmt": lambda model: model.model.decoder.output_projection,
+    "llama": lambda model: model.lm_head,
+}
+
+model_type2lm_head_names = {
+    "fsmt": "model.decoder.output_projection",
+    "llama": "lm_head",
+}
+
+# layers_must_be_placed_together=[(*.embed_positions)]
+
 def balanced_load(
     model_dir,
     num_devices=device_count(),
     is_distillation=False,
     ratio=None,
     devices_idx=None,
+    encoder_decoder=False,
 ):
 
     if ratio is not None:
@@ -17,11 +36,18 @@ def balanced_load(
     import accelerate
 
     with accelerate.init_empty_weights():
-        model = AutoModelForCausalLM.from_pretrained(
-            model_dir,
-            torch_dtype="auto",
-            trust_remote_code=True,
-        )
+        if encoder_decoder:
+            model = AutoModelForSeq2SeqLM.from_pretrained(
+                model_dir,
+                torch_dtype="auto",
+                trust_remote_code=True,
+            )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_dir,
+                torch_dtype="auto",
+                trust_remote_code=True,
+            )
 
     devices_idx = list(range(num_devices)) if devices_idx is None else devices_idx
     assert (
@@ -29,30 +55,99 @@ def balanced_load(
     ), "len(index of allocated device) should equal to num_devices"
 
     def create_manual_device_map(
-        model, num_devices, is_distillation=False, ratio=ratio, devices_idx=devices_idx
+        model,
+        num_devices,
+        is_distillation=False,
+        ratio=ratio,
+        devices_idx=devices_idx,
+        encoder_decoder=encoder_decoder,
     ):
         device_map = {}
-        current_device = 0
 
+        params_cnt = {}  # 用于存放除了layers以外，其他模块的参数量总和？
         # 计算每个模块的参数量
-        lm_head_params = sum(p.numel() for p in model.lm_head.parameters())
-        norm_params = sum(p.numel() for p in model.model.norm.parameters())
-        rotary_emb_params = (
-            sum(p.numel() for p in model.model.rotary_emb.parameters())
-            if hasattr(model.model, "rotary_emb")
-            else 0
-        )
-        layer_params = sum(p.numel() for p in model.model.layers[0].parameters())
+        lm_head = model_type2lm_head_modules[model.config.model_type](model)
+
+        lm_head_params = sum(p.numel() for p in lm_head.parameters())
+        if not model.config.tie_word_embeddings:
+            if encoder_decoder:
+                lm_head_params *= 3  # ed模型有三个embedding
+            else:
+                lm_head_params *= 2
+        params_cnt[model_type2lm_head_names[model.config.model_type]] = lm_head_params
+        if encoder_decoder:
+            params_cnt["model.encoder.embed_positions"] = sum(
+                p.numel() for p in model.model.encoder.embed_positions.parameters()
+            )
+            params_cnt["model.decoder.embed_positions"] = sum(
+                p.numel() for p in model.model.encoder.embed_positions.parameters()
+            )
+        if hasattr(model.model, "norm"):
+            norm_params = sum(p.numel() for p in model.model.norm.parameters())
+            params_cnt["model.norm"] = norm_params
+
+        if hasattr(model.model, "rotary_emb"):
+            rotary_emb_params = sum(
+                p.numel() for p in model.model.rotary_emb.parameters()
+            )
+            params_cnt["model.rotary_emb"] = rotary_emb_params
+
+        if encoder_decoder:
+            encoder_layer_params = sum(
+                p.numel() for p in model.model.encoder.layers[0].parameters()
+            )
+            # 没办法，decoder还有个ca呢,而且有时候ffn_dim也不同，比如宽窄模型
+            decoder_layer_params = sum(
+                p.numel() for p in model.model.decoder.layers[0].parameters()
+            )
+
+            # NOTE 我认为细粒度一点的可能会让层分配的更均匀，因为我下面设的是四舍五入
+            layer_params = min(encoder_layer_params, decoder_layer_params)
+
+        else:
+            layer_params = sum(p.numel() for p in model.model.layers[0].parameters())
 
         # 计算每个模块等效的层数
-        ratio_lm_head = math.ceil(lm_head_params / layer_params)
-        ratio_norm = math.ceil(norm_params / layer_params)
-        ratio_rotary_emb = (
-            math.ceil(rotary_emb_params / layer_params) if rotary_emb_params > 0 else 0
-        )
+        params_ratio = {}
+        for i, item in enumerate(params_cnt.items()):
+            key, value = item
+            params_ratio[key] = round(value / layer_params)
 
-        num_layers = model.config.num_hidden_layers
-        total_layers = num_layers + ratio_lm_head + ratio_norm + ratio_rotary_emb
+        # ratio_lm_head = round(lm_head_params / layer_params)
+        # ratio_norm = round(norm_params / layer_params)
+        # ratio_rotary_emb = (
+        #     round(rotary_emb_params / layer_params) if rotary_emb_params > 0 else 0
+        # )
+
+        # import pdb
+        # pdb.set_trace()
+        
+        total_layers = 0
+        if encoder_decoder:
+            if encoder_layer_params < decoder_layer_params:
+                total_layers += model.config.encoder_layers
+                total_layers += (
+                    round(encoder_layer_params / decoder_layer_params)
+                    * model.config.decoder_layers
+                )
+            else:
+                total_layers += model.config.decoder_layers
+                total_layers += (
+                    round(encoder_layer_params / decoder_layer_params)
+                    * model.config.encoder_layers
+                )
+
+        else:
+            total_layers += model.config.num_hidden_layers
+
+        total_layers += sum(d for d in params_ratio.values())
+
+        # total_layers +=
+        # num_layers = (
+        #     model.config.encoder_layers + model.config.decoder_layers
+
+        #     else model.config.num_hidden_layers
+        # )
 
         # 确定每个设备应该分配到的层数
         if ratio is not None:
@@ -63,33 +158,68 @@ def balanced_load(
             ]
 
         remainder = total_layers - sum(layers_per_device)
+
         # 从后面开始分配剩余层
         for i in range(remainder - 1, -1, -1):
             layers_per_device[i] += 1
-        layers = [f"model.layers.{i}" for i in range(num_layers)]
 
-        # 将 lm_head、norm 和 rotary_emb 模块视为“层”进行分配
-        special_layers = {
-            "lm_head": ratio_lm_head,
-            "model.norm": ratio_norm,
-            "model.rotary_emb": ratio_rotary_emb,
-        }
+        layers = {}
+        if encoder_decoder:
 
-        for layer, count in special_layers.items():
-            if count >= 0:
-                while layers_per_device[current_device] == 0:
-                    current_device += 1
-                device_map[layer] = devices_idx[current_device]
-                layers_per_device[current_device] -= count
+            for i in range(model.config.encoder_layers):
+                layers[f"model.encoder.layers.{i}"] = (
+                    1
+                    if encoder_layer_params <= decoder_layer_params
+                    else round(encoder_layer_params / decoder_layer_params)
+                )
 
-        # 分配普通层
-        for layer in layers:
-            while layers_per_device[current_device] == 0:
+            for i in range(model.config.encoder_layers):
+                layers[f"model.decoder.layers.{i}"] = (
+                    1
+                    if encoder_layer_params >= decoder_layer_params
+                    else round(decoder_layer_params / encoder_layer_params)
+                )
+
+        else:
+            for i in range(model.config.num_hidden_layers):
+                layers[f"model.layers.{i}"] = 1
+
+        
+  
+        # 开始分配特殊层
+        for layer_name, layer_burden in params_ratio.items():
+
+            current_device = 0
+            while (
+                current_device < num_devices
+                and layers_per_device[current_device] - layer_burden < 0
+            ):
                 current_device += 1
-            device_map[layer] = devices_idx[current_device]
-            layers_per_device[current_device] -= 1
+            device_map[layer_name] = devices_idx[current_device]
+            layers_per_device[current_device] -= layer_burden
 
-        device_map["model.embed_tokens"] = devices_idx[0]
+ 
+        
+        # 先分配普通层，因为他们数量很多，保证他们尽可能在一个device上会加快推理速度
+        for layer_name, layer_burden in layers.items():
+            current_device = 0
+            while current_device < num_devices and layers_per_device[current_device] - layer_burden < 0:
+                current_device += 1
+            device_map[layer_name] = devices_idx[current_device]
+            layers_per_device[current_device] -= layer_burden
+        if encoder_decoder:
+            # 考虑到tied weights，他们需要在一起，而且我已经把他们的重量认定给lm_head了
+            device_map["model.encoder.embed_tokens"] = device_map[
+                model_type2lm_head_names[model.config.model_type]
+            ]
+            device_map["model.decoder.embed_tokens"] = device_map[
+                model_type2lm_head_names[model.config.model_type]
+            ]
+        else:
+            device_map["model.embed_tokens"] = device_map[
+                model_type2lm_head_names[model.config.model_type]
+            ]
+
 
         return device_map
 
@@ -111,16 +241,27 @@ def balanced_load(
         print(f"  Modules: {', '.join(stats['modules'])}")
 
     del model
-
-    model = AutoModelForCausalLM.from_pretrained(
-        model_dir,
-        torch_dtype="auto",
-        device_map=device_map,
-        attn_implementation=(
-            "eager"
-            if "gemma" in model_dir.lower() or "phi" in model_dir.lower()
-            else "sdpa"
-        ),
-        trust_remote_code=True,
-    )
+    if encoder_decoder:
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+            model_dir,
+            torch_dtype="auto",
+            device_map=device_map,
+            low_cpu_mem_usage='True',
+            trust_remote_code=True,
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_dir,
+            torch_dtype="auto",
+            device_map=device_map,
+            low_cpu_mem_usage='True',
+            attn_implementation=(
+                "eager"
+                if "gemma" in model_dir.lower() or "phi" in model_dir.lower()
+                else "sdpa"
+            ),
+            trust_remote_code=True,
+        )
+    # debug for nmt model
+    # torch.allclose(model.model.encoder.embed_tokens.weight,model.model.decoder.embed_tokens.weight)
     return model
